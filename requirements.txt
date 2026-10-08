@@ -1,0 +1,13 @@
+# 杭州麻将 AI —— 运行期第三方依赖
+#
+# ★ 只有两个（其余全是标准库：urllib / ssl / threading / json / argparse …）
+#   实测依据：tools/extract_core.py 对全部核心文件做 ast 导入解析，
+#   非标准库、非本仓的 import 只有下面这两个。
+#
+# 版本按本机实测（torch 2.14.0+cpu / numpy 2.5.3）写下；两者只要 API 兼容，
+# 小版本差异不影响 —— 权重是纯 state_dict，`torch.load(..., weights_only=False)`。
+numpy>=2.0
+torch>=2.4
+
+# ★ 可选：只用 CPU 打牌时装 CPU 版即可（本仓线上客户端就是 CPU 版）。
+#   GPU 只在**训练**时才需要（rl_boot.bootstrap() 里 MJ_USE_GPU=1 才挂 _pkgs_gpu）。
