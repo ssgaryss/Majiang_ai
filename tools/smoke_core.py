@@ -20,6 +20,10 @@ import os
 import sys
 import traceback
 
+# ★ 控制台编码兜底（Windows GBK 控制台打印 ✓/中文会崩；本仓其它脚本同做法）
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 def main():
     ap = argparse.ArgumentParser()

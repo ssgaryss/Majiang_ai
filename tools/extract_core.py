@@ -23,8 +23,25 @@ import os
 import shutil
 import sys
 
+# ★ 控制台编码兜底（Windows GBK 控制台打印中文会崩；本仓其它脚本同做法）
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ★ 标准库白名单不用手写：用 sys.stdlib_module_names（3.10+）判定即可。
 STDLIB = set(getattr(sys, "stdlib_module_names", ()))
+
+
+class ExtendAction(argparse.Action):
+    """让重复出现的 `nargs='*'` 选项**累加**而不是互相覆盖。
+
+    为什么必须这样：argparse 对同一个 `nargs='*'` 选项出现多次时，
+    **最后一次会覆盖前面所有次**（默认 store 语义）。实测代价 ——
+    `--map A=B --map C=D` 只生效 C=D，A=B **被静默丢弃且不报错** ✗。
+    这与本仓记录过的「传了参数而输出没变 ⇒ 立刻怀疑参数没被用」是同一类坑，
+    所以在工具侧根治：重复给就累加。"""
+    def __call__(self, parser, namespace, values, option_string=None):
+        cur = getattr(namespace, self.dest, None) or []
+        setattr(namespace, self.dest, list(cur) + list(values))
 
 
 def local_module_name(repo, mod_top):
@@ -125,10 +142,15 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--roots", nargs="+", required=True,
                     help="入口脚本（相对 repo）")
-    ap.add_argument("--assets", nargs="*", default=[],
-                    help="额外要带上的非代码文件（相对 repo，缺省忽略不存在的）")
-    ap.add_argument("--dirs", nargs="*", default=[],
-                    help="额外要整体带上的目录（相对 repo；自动跳过 __pycache__/*.pyc）")
+    ap.add_argument("--assets", nargs="*", default=[], action=ExtendAction,
+                    help="额外要带上的非代码文件（相对 repo，缺省忽略不存在的）★ 可重复，累加 ✓")
+    ap.add_argument("--dirs", nargs="*", default=[], action=ExtendAction,
+                    help="额外要整体带上的目录（相对 repo；自动跳过 __pycache__/*.pyc）★ 可重复，累加 ✓")
+    ap.add_argument("--map", nargs="*", default=[], action=ExtendAction,
+                    help="改名搬运 SRC=DST（相对 repo 的源 -> 交付物内的目标路径）。"
+                         "用途：手写的交付物 README 在仓里叫 README_BOT.md（仓根已有"
+                         "历史 README.md，不能覆盖），进交付物时改成 README.md。"
+                         "★ 可重复，累加 ✓")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list", action="store_true", help="逐个列出闭包文件")
     a = ap.parse_args()
@@ -215,6 +237,19 @@ def main():
         dst = os.path.join(out, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(p, dst)
+    for spec in a.map:
+        if "=" not in spec:
+            print("  !! --map 需要 SRC=DST 形式，跳过: %r" % spec)
+            continue
+        src_rel, dst_rel = spec.split("=", 1)
+        src = os.path.join(repo, src_rel)
+        if not os.path.isfile(src):
+            print("  !! --map 源不存在，跳过: %s" % src_rel)
+            continue
+        dst = os.path.join(out, dst_rel)
+        os.makedirs(os.path.dirname(dst) or out, exist_ok=True)
+        shutil.copy2(src, dst)
+        print("  --map %s -> %s" % (src_rel, dst_rel))
     print("\n已写出: %s" % out)
     return 0
 
