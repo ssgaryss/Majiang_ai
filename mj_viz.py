@@ -23,7 +23,7 @@
     python mj_viz.py                 # 起服务并自动开浏览器
     python mj_viz.py --port 8765
     python mj_viz.py --export-only   # 只导出，不起服务
-    python mj_viz.py --data-dir D:\\path\\to\\majiang_bot
+    python mj_viz.py --data-dir <放 live*.jsonl / reviews 的目录>   # 默认就是本目录
 
 口径（每个数字怎么来的，页面上「指标说明」也写了同一份）
 --------------------------------------------------------
@@ -993,7 +993,7 @@ def main():
         print("  找过这些地方：")
         for c in tried:
             print("    %s" % c)
-        print("  用 --data-dir D:\\path\\to\\majiang_bot 指一下。")
+        print("  用 --data-dir <目录> 指一下（放 live*.jsonl 与 reviews/ 的地方）。")
 
     print("扫描数据：%s" % data_dir)
     ds = build(data_dir)

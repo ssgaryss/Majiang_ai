@@ -1,1 +1,1 @@
-ckpt:rl_aux_0004.pt,shanten:1:1:2:5:1:1:0
+ckpt:rl_aux_0004.pt

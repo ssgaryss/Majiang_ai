@@ -24,6 +24,11 @@ import os
 import re
 import sys
 
+# ★ 控制台编码兜底：Windows 默认 GBK 控制台打印 ✓/✗ 会抛 UnicodeEncodeError ✗
+#   （本仓其它脚本都有这一句，本文件此前漏了 ⇒ 工具自己崩在最后一行 ✓ 已修 ✓）
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 SENSITIVE = re.compile(r"(token|secret|passwd|password|credential|\.pem$|id_rsa|apikey|api_key)",
                        re.I)
 

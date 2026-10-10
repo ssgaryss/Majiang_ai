@@ -438,6 +438,13 @@ class GameRunner(threading.Thread):
         # 这些会变成一次必然被拒的提交（409 + 白烧额度）。
         # 它同时是"网络到底有多糟"的可见指标。
         self.stale_skips = 0
+        # ★ 2026-10-09：被**网络抖动**（超时/断连）打断、但靠"重取状态后继续"
+        #   救回来的次数。它们此前会**直接结束整场**（外层兜底 except）——
+        #   实测两场只打了 1~3 手就"结束"，而其实只是网络抖了一下。
+        #   `submit_timeouts` 是其中发生在**动作提交**上的子集：那一类必须
+        #   先重取状态确认动作有没有生效，绝不能盲目重发。
+        self.net_errors = 0
+        self.submit_timeouts = 0
         # 被拒时的延迟明细（含当时的 drawn 与本地判胡结果）。
         self.reject_lat = []
         self._conflict_sig = None    # 见 409 分支：同一状态只解禁一次重试
@@ -468,6 +475,9 @@ class GameRunner(threading.Thread):
         # 都会假性变窄（标准误被低估约 √10 ≈ 3 倍）。有了局号才能按 (房间, 局号)
         # 去重，得到真正独立的观测。
         self.round_nos = []
+        # 与 `round_deltas` 一一对应的**我方副露数** —— 让「不划算的吃碰」可测，
+        # 见 `_acc_round` 的说明。（历史上没有这个字段 ⇒ 那一类错误只能靠印象。）
+        self.round_melds = []
         # 可胡未胡的**结构化**明细（每局弃胡次数是低方差机制指标）。
         #
         # ⚠ 字段名必须与上面的 `self.missed`（那是**计数**：碰/吃响应窗口错过的次数）
@@ -485,8 +495,17 @@ class GameRunner(threading.Thread):
         if self.player.trace:
             say("[%s|%s] %s" % (self.gid[-6:], self.strategy.name, msg))
 
-    def _acc_round(self, sc, round_no=None):
+    def _acc_round(self, sc, round_no=None, melds=None):
         """累计分发生变化 = 刚打完一局，把四家得失记一笔（首帧只做基线）。
+
+        `melds` = 该局结束时的**我方副露数**。为什么要跟着记：
+        「不划算的吃碰」这一类高代价错误**目前完全不可测**
+        （`tools/analyze_errors.py` 表 C 有完整论证）—— 因为每场记录里
+        既没有我方副露数、也没有动作序列，而 `opp_melds` 记的是**对手**的。
+        补这一个字段是让它可测的**最小改动**：有了它就能按"副露数分档"看
+        逐局得分（0/1/2 摊各档的局均），这是判断"吃碰到底亏不亏"的第一步。
+        ⚠ 它只是**分档相关**，不是因果 —— 要吃碰的往往是好牌，混杂很重。
+          真正的因果要靠同 seed 配对（`probe_posture_frontier.py` 那条路）。
 
         同时把**首帧的累计分**留成 `deltas_base`：房中途重启客户端时，接管的
         是进行中的对局，第一条快照的分数已经不是 0 —— 没有这个基线，
@@ -506,6 +525,7 @@ class GameRunner(threading.Thread):
             return
         self.round_deltas.append([sc[i] - self._last_scores[i] for i in range(4)])
         self.round_nos.append(round_no)
+        self.round_melds.append(melds)
         self._last_scores = list(sc)
 
     def run(self):
@@ -568,7 +588,7 @@ class GameRunner(threading.Thread):
                 else:
                     _t_sse = _t_gap = time.time()
                 self.player.limiter.wait()
-                # ★ 分段计时：把"从 SSE 唤醒到提交完成"拆成四段，才能定位长尾。
+                # ★ 分段计时：把"从 SSE 唤醒到提交完成"拆成**六段**，才能定位长尾。
                 #
                 # 为什么要拆：端到端延迟的 p99 是 1479 ms、最大 5998 ms，
                 # 而**本地纯计算只要 17 ms**（probe_latency.py，p99 72 ms）。
@@ -577,6 +597,12 @@ class GameRunner(threading.Thread):
                 #   ② limiter.wait()（全局 16/秒 额度排队，10 桌共享）
                 #   ③ GET / POST 的网络往返
                 # 不拆开就只能猜；拆开之后一眼能看出该动哪一个。
+                #
+                # ★★ 2026-10-09：补上后两段（**决策**与**提交**）。
+                #   原实现只到 GET 为止 ⇒ 线上日志里 `rl_vA3` 与 `rl_aux_0004`
+                #   的网络同构、延迟中位却差 **8.7 倍**（73 ms vs 633 ms），
+                #   而当时的读数**无法区分**"模型推理慢"与"等待慢"。
+                #   段序定义见 `_seg_report`（那里也有这条顺序的测试）。
                 _t_lim = time.time()
                 # 用 SSE 时每次直接拿全量快照（seq=0 → 立即返回，不做长轮询），
                 # 一批事件只花 1 个请求；唤醒交给 Notifier，不再靠高频轮询。
@@ -605,14 +631,32 @@ class GameRunner(threading.Thread):
                         self.gone = True
                         return
                     raise
+                except OSError as e:
+                    # ★★ 2026-10-09：**快照 GET 超时不再杀死整场** ★★
+                    #   实测（`temp/live_check.log`）traceback 全是这一行：
+                    #     `api("GET", q, ..., timeout=1.5, tries=1)` -> TimeoutError
+                    #   它穿透到最外层兜底 `except Exception` ⇒ 整个 GameRunner 结束
+                    #   ⇒ 服务端只好代打，日志里表现为"这一场只打了 1~3 手就结束"。
+                    #   而快照本来就是**可以重取**的 ⇒ 丢掉这一轮、下一轮再取即可。
+                    self.net_errors += 1
+                    if self.net_errors > _MAX_NET_RECOVER:
+                        say("[%s] 场 %s **网络连续异常 %d 次**（%s）→ 结束本场"
+                            % (self.player.label, self.gid, self.net_errors,
+                               type(e).__name__))
+                        return
+                    say("[%s] 场 %s 快照超时（%s）→ 丢弃本轮，下一轮重取"
+                        % (self.player.label, self.gid, type(e).__name__))
+                    continue
                 last_fetch = time.time()
                 t_snap = last_fetch
                 # 记录这一段的分段耗时（毫秒）：gap 睡眠 / 令牌排队 / GET 往返。
                 # 只在真正有动作要提交时才用得上，但先记下来无妨。
-                seg = ((t_snap - _t_sse) * 1000.0,          # SSE 唤醒 → 可以取快照
-                       (_t_lim - _t_gap) * 1000.0,          # gap 睡眠
-                       (t_wake - _t_lim) * 1000.0,          # 令牌排队
-                       (t_snap - t_wake) * 1000.0)          # GET 往返
+                seg = [(t_snap - _t_sse) * 1000.0,        # SSE 唤醒 → 可以取快照
+                       (_t_lim - _t_gap) * 1000.0,         # gap 睡眠（人为限速，可调）
+                       (t_wake - _t_lim) * 1000.0,         # 令牌排队（全局额度，多桌共享）
+                       (t_snap - t_wake) * 1000.0,         # GET 往返（网络 / 服务端）
+                       0.0,                                # 决策：特征计算 + 推理
+                       0.0]                                # 提交 POST 往返
                 if res is None:
                     continue
                 if res.get("pending"):
@@ -633,6 +677,8 @@ class GameRunner(threading.Thread):
                         # 与 round_deltas 一一对应的局号 —— 线上同房间有 10 个客户端
                         # 各记同一批局，只有带上局号才能跨客户端去重（见字段说明）。
                         "round_nos": self.round_nos,
+                        # 与我方副露数一一对应 ⇒ 「不划算的吃碰」的唯一测点
+                        "my_meld_sets": self.round_melds,
                         # ★ 可胡未胡明细：事件流不含起手，弃胡**无法**事后重建，
                         #   只能在客户端当场判。这是"每局弃胡 x 次"的唯一来源。
                         "missed_detail": self.missed_detail,
@@ -648,8 +694,11 @@ class GameRunner(threading.Thread):
                     for ev in res.get("events") or []:
                         seq = ev.get("seq", seq)
                     self.player.limiter.wait()
-                    full = api("GET", "/api/games/%s/state?seq=0" % self.gid,
-                               self.player.server, self.player.token) or {}
+                    # ★ 必须走 `_fetch_full_snapshot`（短超时 + 不重试）。
+                    #   内联 `api(...)` 会用默认 timeout=35/tries=6 ⇒ 最坏阻塞 258 秒，
+                    #   而 1 秒的碰/吃窗口里这等于必然错过。见该函数的 docstring。
+                    full = _fetch_full_snapshot(self.player.server, self.player.token,
+                                                self.gid)
                     snap = full.get("snapshot") or {}
                     seq = full.get("seq", seq)
                 else:
@@ -671,11 +720,13 @@ class GameRunner(threading.Thread):
                 # 那一局值多少分"这些**机制指标**的方差小一个量级 —— 线上 A/B 拿它们
                 # 当因变量，检验力比看总分高得多。此前这些量只能靠回放接口事后重算
                 # （要额外发请求、还要处理分页），现在客户端自己就留下了。
-                self._acc_round(snap.get("scores") or [], snap.get("round_no"))
+                self._acc_round(snap.get("scores") or [], snap.get("round_no"),
+                                snap.get("meld_sets"))
 
                 # 状态签名：同一状态下只提交一次动作。见 _state_sig 的说明。
                 sig = _state_sig(snap, phase)
 
+                _t_dec = time.time()      # ★ 分段计时：特征计算 + 推理
                 v = View(snap, seat)
                 missed = None
                 if phase == "draw" and snap.get("turn") == seat:
@@ -710,6 +761,11 @@ class GameRunner(threading.Thread):
                     act = self.strategy.on_window(v, phase)
                 else:
                     continue
+                # ★ 决策段（特征计算 + 推理）—— 目标第 3 条要求的分段之一。
+                #   为什么必须单独量：`rl_vA3` 与 `rl_aux_0004` 的网络同构，
+                #   但历史日志里延迟中位差 **8.7 倍**（73 ms vs 633 ms）。
+                #   没有这一段就只能猜是"模型慢"还是"等待慢"。
+                seg[4] = (time.time() - _t_dec) * 1000.0
                 if act is None:
                     continue
 
@@ -857,9 +913,11 @@ class GameRunner(threading.Thread):
                                (v.counts[tile_index(_ldv)]
                                 if _ldv else -1)))
                         continue
+                _t_post = time.time()         # ★ 分段计时：提交 POST 往返
                 try:
                     api("POST", "/api/games/%s/action" % self.gid, self.player.server,
                         self.player.token, body=act)
+                    seg[5] = (time.time() - _t_post) * 1000.0
                     self.actions += 1
                     self.submits += 1            # ★ 其中"成功提交"单独计数（§Z.1326）
                     # 记录"从拿到快照到提交完成"的耗时。
@@ -990,6 +1048,28 @@ class GameRunner(threading.Thread):
                             pass
                     seq = 0
                     continue
+                except OSError as e:
+                    # ★★ 2026-10-09：**提交超时/断连 ≠ 动作失效** ★★
+                    #   这是目标第 3 条点名的那一条，但它的真实形态和注释里写的
+                    #   不一样：`api()` **不会**为超时重试（它只重试 429/5xx/
+                    #   409+MATCH_BUSY）⇒ 超时会一路穿透到最外层兜底 `except`，
+                    #   **把整个 GameRunner 结束掉**（= 白丢一整场）。
+                    #   ⇒ 所以要防的不是"盲目重发"，而是"整场被网络抖动打死"。
+                    #   处置：**绝不重发同一个动作**（服务端可能已经执行了，
+                    #         重复的 peng/gang 语义比重复的 discard 更糟），
+                    #         改为重取权威状态（`seq=0`）后按**新状态**重新决策 ——
+                    #         新状态里如果动作已生效，签名自然就变了，不会再提交它。
+                    self.net_errors += 1
+                    self.submit_timeouts += 1
+                    if self.net_errors > _MAX_NET_RECOVER:
+                        say("[%s] 场 %s **网络连续异常 %d 次**（%s）→ 结束本场"
+                            % (self.player.label, self.gid, self.net_errors,
+                               type(e).__name__))
+                        return
+                    say("[%s] 场 %s **提交超时/断连**（%s）→ 重取状态确认是否已执行，"
+                        "不盲目重发" % (self.player.label, self.gid, type(e).__name__))
+                    seq = 0
+                    continue
         except ApiError as e:
             if e.status != 404:
                 say("[%s] 场 %s API 错误: %s" % (self.player.label, self.gid, e))
@@ -1035,6 +1115,7 @@ class GameRunner(threading.Thread):
                     "avg_shanten": None, "discards": self.sh_n,
                     "round_deltas": self.round_deltas,
                     "round_nos": self.round_nos,
+                    "my_meld_sets": self.round_melds,
                     "missed_detail": self.missed_detail,
                     "deltas_base": self._base_scores,
                     "crashed": True})
@@ -1073,24 +1154,27 @@ class GameRunner(threading.Thread):
             # 令牌排队大→额度真的不够（要减少请求或降低并发桌数）；
             # GET 往返大→网络/服务端慢。
             if self.segs:
-                worst = sorted(self.segs, key=lambda x: -(x[0] + x[3]))[:max(1, len(self.segs) // 20)]
-                n = len(worst)
-                lat_txt += " | 最慢5%%分段: gap%.0f 令牌%.0f GET%.0f" % (
-                    sum(x[1] for x in worst) / n,
-                    sum(x[2] for x in worst) / n,
-                    sum(x[3] for x in worst) / n)
+                _txt, _ = _seg_report(self.segs, frac=0.05)
+                lat_txt += " | " + _txt
             # ★ 2026-10-03（第 922 轮）**纯打印追加**：把两个"可见损失"计数器也打进场结束行，
             #   使它们**可按臂归集**（此前只在进程级哨兵里 ⇒ 无法分臂 ⇒ GOAL_STATUS §Z.1298）。
             #   · `giveup_actions`：同一状态反复被拒 ⇒ 放弃动作改为出牌 ⇒ **丢一手本可胡的牌**
             #   · `stale_skips`  ：快照过期（出牌阶段但 drawn 为空）而跳过动作 ⇒ **网络把快照拖过期**
             #   ⚠ 二者都**早已存在**（`:405` / `:432`）⇒ 本改动**只多打两个数**，不改任何逻辑。
+            #   ★ 2026-10-09 再追加两个（**必须放在行尾**）：
+            #     · `网络`       = 被网络抖动打断、但重取状态后救回来的次数
+            #     · `提交超时`   = 其中发生在**动作提交**上的子集（那一类要先确认是否已执行）
+            #     ⚠ 放行尾是硬要求：`live*.log` 的汇总行有多个解析器
+            #       （`tools/live_baseline.py` 等），它们在 `最大%d ms` 之后就 `.search`
+            #       到行尾为止 ⇒ **中间插字段会把这些解析器全部打坏**。
             say("[%s] 场 %s 结束：%d 行动 / %d 杠(被拒%d) / %d 窗口错过 / %d 次409 / "
-                "%d 推送 放弃%d 陈旧%d 提交%d 过%d%s"
+                "%d 推送 放弃%d 陈旧%d 提交%d 过%d%s 网络%d 提交超时%d"
                 % (self.player.label, self.gid, self.actions, self.gangs,
                    self.gang_conflicts, self.missed, self.conflicts,
                    (nf.frames if nf is not None else 0),
                    self.giveup_actions, self.stale_skips,
-                   self.submits, self.passes, lat_txt))
+                   self.submits, self.passes, lat_txt,
+                   self.net_errors, self.submit_timeouts))
 
 
 class Player(threading.Thread):
@@ -1405,6 +1489,77 @@ class Player(threading.Thread):
             return None
 
 
+def _is_network_error(exc):
+    """这个异常是不是**网络类**（超时 / 断连），而不是服务端的明确应答？
+
+    ★ 为什么必须把它和 `ApiError` 分开：两者的**语义完全不同** ——
+      · `ApiError(409)` = 服务端**明确说**"这个动作没生效" ⇒ 重取状态后可以再试；
+      · 超时 / 断连      = **不知道**有没有生效 ⇒ 盲目重发可能造成重复动作。
+      ⇒ 后者的正确处置是**先重取权威状态（`seq=0`）确认，再按新状态重新决策**。
+    ★ 为什么不能像以前那样让它穿透：`run()` 最外层有一个兜底 `except Exception`
+      ⇒ **整个 GameRunner 直接结束** ⇒ 一场白丢。
+      实测（`temp/live_check.log`，2026-10-09）：两场只打了 1~3 手就"结束"，
+      而 traceback 全部指向 `mj_bot.py` 的**快照 GET** ——
+      也就是说"网络抖一下"被记成了"这一场打完了"。
+    ★ `ApiError` 继承自 `Exception`（不是 `OSError`），所以这个判据是干净的。
+    """
+    return isinstance(exc, OSError)
+
+
+# 本场允许"网络抖动 → 重取状态 → 继续"的次数上限。
+# 取 8：一次网络抽风（本仓实测最长约 7 分钟）会命中好几次，8 够扛过去；
+# 而真断了（服务端没了）也不至于永远循环 —— 超限就结束本场，交给上层重新匹配。
+_MAX_NET_RECOVER = 8
+
+
+def _seg_report(segs, frac=0.05):
+    """把分段耗时汇总成一行：取**最慢的一批**（默认 5%）逐段求均值。
+
+    段序（与 `GameRunner.run` 里构造 `seg` 的地方**必须一致**）：
+        0 SSE 唤醒 → 可以取快照      1 gap 睡眠（人为限速，可调）
+        2 令牌排队（全局额度）        3 GET 往返（网络 / 服务端）
+        4 决策：特征计算 + 推理       5 提交 POST 往返
+
+    这一行直接回答"该优化谁"：
+        gap 大   → 调 `--fetch-gap-max`
+        令牌大   → 额度真不够（减少请求或降并发桌数）
+        GET 大   → 网络 / 服务端慢
+        **决策大** → 特征或推理慢（`discard=rank/rank2` 会加载排序器）
+        **提交大** → 服务端接受动作慢（超过 1 秒窗口就会吃到 409）
+
+    ★ 抽成模块级函数是为了**可测**：内联在 `run()` 里只能靠跑线上来验，
+      而这里恰恰需要钉住"段序不会悄悄错位"（错位会把读数指向错误的优化目标）。
+    返回 `(文本, 参与统计的段数)`；无数据时返回 `("", 0)`。
+    """
+    if not segs:
+        return "", 0
+    worst = sorted(segs, key=lambda x: -(x[0] + x[3] + x[4] + x[5]))[
+        :max(1, int(len(segs) * frac))]
+    n = len(worst)
+    return ("最慢5%%分段: gap%.0f 令牌%.0f GET%.0f 决策%.0f 提交%.0f" % (
+        sum(x[1] for x in worst) / n,
+        sum(x[2] for x in worst) / n,
+        sum(x[3] for x in worst) / n,
+        sum(x[4] for x in worst) / n,
+        sum(x[5] for x in worst) / n), n)
+
+
+def _fetch_full_snapshot(server, token, gid):
+    """取**全量快照**（`seq=0`）—— 必须用短超时 + 不重试。
+
+    为什么不能沿用 `api()` 的默认值（`timeout=35, tries=6` ⇒ 最坏阻塞约 258 秒）：
+    快照只在 1~3 秒的窗口内有用，超窗拿到也没有意义；而在窗口里阻塞 258 秒
+    不只错过这一手，还会把整个 `GameRunner` 卡住（同一进程里其余桌同受影响）。
+    全量快照**本来就可以重取**（下一轮循环还会再取一次），所以失败就让调用方
+    `continue`，没有"必须等它成功"的理由。
+
+    ★ 抽成模块级函数的唯一目的是**可测**：内联在 `run()` 里就没法断言
+      "它到底传了什么超时" —— 而本缺陷恰恰就是"传错了超时"，静默且致命。
+    """
+    return api("GET", "/api/games/%s/state?seq=0" % gid, server, token,
+               timeout=1.5, tries=1) or {}
+
+
 def _state_sig(snap, phase):
     """「同一状态」的判据 —— GameRunner 用它去重，避免对同一状态重复提交动作。
 
@@ -1417,11 +1572,37 @@ def _state_sig(snap, phase):
     这一手就会被误判成"已经响应过"直接跳过，然后服务端 3 秒超时代打
     （等价于随机弃牌）。把「刚摸的牌 + 自己的手牌」纳入签名后，
     状态变了就一定不同；而真正没变的状态仍然只提交一次。
+
+    ★★ 2026-10-09 再加固一层（**响应窗口的身份**）★★
+      上面那次补的是**出牌阶段**：`drawn_tile + my_hand` 一摸牌就变，兜得住。
+      但**响应窗口**（`response_peng` / `response_chi`）里这两者**都不变**
+      —— 窗口不是自己摸牌 ⇒ 只剩 `ndisc` 一个区分量，而它又会被吃碰**减小**
+      ⇒ 两个不同的响应窗口完全可能撞成同一个签名 ⇒ 第二手被静默跳过
+      ⇒ 服务端 3 秒超时代打（等价随机弃牌，可能白丢一个碰甚至一个胡）。
+      ⇒ 把决定"窗口合法动作集"的三个量并进签名：
+        · `responding_seats` —— 这一手要哪些座位响应（窗口本身的身份）
+        · `last_discard`     —— 我们响应的是哪张牌（碰/吃/杠都取决于它）
+        · `restricted`       —— 抓打圈（受限方不能吃碰明杠、只能打刚摸的）
+
+    ⚠ **这个方向的代价必须知道**：签名变细 ⇒ `sig == responded` 这个去重守卫
+      触发得更少 ⇒ **提交次数只会变多，不会变少**。收益是"不再静默跳过该响应的一手"，
+      代价是理论上可能出现"同一窗口二次提交"（服务端会 409 拒掉，无害但烧额度）。
+      ⇒ **上线后必须盯 409 率**（本仓实测基线：模型臂 4.19% / 规则臂 1.01%）。
+        若 409 明显上升，第一个该回退的就是 `responding_seats` 这一项
+        （它对"窗口身份"的贡献最小 —— `last_discard` 才是关键区分量）。
     """
     ndisc = sum(len(d) for d in (snap.get("discards") or []))
+    god = snap.get("god") or {}
+    # 与 `View.restricted` **逐字同构**（catch_play 且本人不是打财神者）；
+    # 这里直接读快照而不建 View，因为本函数在热路径上，每帧都要调用。
+    restricted = (bool(god.get("catch_play"))
+                  and god.get("god_discarder_seat") != snap.get("seat"))
     return (snap.get("round_no"), phase, ndisc, snap.get("turn"),
             snap.get("drawn_tile") or "",
-            tuple(sorted(snap.get("my_hand") or [])))
+            tuple(sorted(snap.get("my_hand") or [])),
+            tuple(snap.get("responding_seats") or ()),
+            snap.get("last_discard") or "",
+            restricted)
 
 
 # 场次 id 的形状：`<段>_<段>[_<段>...]_b<批>_t<桌>`，至少两个前缀段。
@@ -1635,6 +1816,7 @@ def _selftest():
     g = GameRunner.__new__(GameRunner)          # 只测 _acc_round，不走 __init__
     g.round_deltas = []
     g.round_nos = []
+    g.round_melds = []
     g._last_scores = []
     g._acc_round([0, 0, 0, 0], 1)
     chk("首个快照只做基线、不记账", g.round_deltas, [])
@@ -1661,6 +1843,16 @@ def _selftest():
     chk("分数变了但 round_no 未推进 -> 仍要记", len(g.round_deltas), 3)
     chk("局号记的是快照当时的值", g.round_nos, [1, 2, 3])
     chk("新记的得失正确", g.round_deltas[-1], [2, 0, -1, -1])
+    # ★ 副露数列表：让「不划算的吃碰」可测的唯一测点（见 `_acc_round` 的说明）。
+    #   它与 round_deltas 必须**一一对应** —— 错位会让"第 N 局的副露数"配到
+    #   另一局的得分上，而那种错**不会报错**，只会让分档统计整体失真。
+    #   ⚠ 本块必须**放在既有断言之后**：`_acc_round` 会把 `_last_scores`
+    #     推进到新值，插在中间会打断后续断言的前置状态（我刚踩过一次）。
+    chk("副露数列表与得失一一对应", len(g.round_melds), len(g.round_deltas))
+    g._acc_round([14, 2, -10, -6], 4, 2)          # 带副露数
+    chk("副露数被记到同一位置", g.round_melds[-1], 2)
+    chk("加了副露数之后仍一一对应",
+        len(g.round_melds) == len(g.round_deltas) == len(g.round_nos), True)
 
     print()
     print("[状态签名]")
@@ -1679,6 +1871,107 @@ def _selftest():
     n2 = dict(base, drawn_tile="9t", my_hand=["1w", "2w", "3w"])
     chk("完全相同的状态 -> 同签名（不会重复提交）",
         _state_sig(n1, "draw") == _state_sig(n2, "draw"), True)
+
+    # ---- 响应窗口的身份：**只靠 ndisc 区分不了窗口** ★★ ----
+    #
+    # 目标第 3 条点名的缺陷：`responding_seats`、**响应的那张弃牌**、
+    # **抓打圈状态**都不在签名里 —— 而这三个量恰好决定"窗口里的合法动作集"。
+    # 出牌阶段的签名靠 `drawn_tile + my_hand` 兜底，窗口阶段这两者都**不变**
+    # （不是自己摸牌），于是**只剩 `ndisc` 一个区分量**；
+    # 而 `ndisc` 已经被证明会因为吃碰**减小**（见 `_state_sig` 的 docstring），
+    # 也就是说两个不同的响应窗口完全可能撞成同一个签名 ⇒ 第二手被静默跳过
+    # ⇒ 服务端 3 秒超时代打（等价随机弃牌，甚至丢掉可以碰/胡的一手）。
+    print()
+    print("[响应窗口签名]")
+    w = {"round_no": 1, "discards": [[], ["1w"], ["2b"], ["3t"], []], "turn": 0,
+         "drawn_tile": "", "my_hand": ["1w", "2w", "3w"], "last_discard": "3t",
+         "responding_seats": [1], "seat": 1,
+         "god": {"catch_play": False, "god_discarder_seat": -1}}
+    chk("同一窗口两次 -> 同签名",
+        _state_sig(w, "response_peng") == _state_sig(dict(w), "response_peng"), True)
+    chk("响应座位集合不同 -> 必须不同签名",
+        _state_sig(w, "response_peng") != _state_sig(
+            dict(w, responding_seats=[2]), "response_peng"), True)
+    chk("响应的那张弃牌不同 -> 必须不同签名",
+        _state_sig(w, "response_peng") != _state_sig(
+            dict(w, last_discard="4t"), "response_peng"), True)
+    chk("抓打圈开关变化 -> 必须不同签名",
+        _state_sig(w, "response_peng") != _state_sig(
+            dict(w, god={"catch_play": True, "god_discarder_seat": 0}),
+            "response_peng"), True)
+    chk("抓打圈豁免席位变化 -> 必须不同签名",
+        _state_sig(dict(w, god={"catch_play": True, "god_discarder_seat": 0}),
+                   "response_peng") != _state_sig(
+            dict(w, god={"catch_play": True, "god_discarder_seat": 1}),
+            "response_peng"), True)
+
+    # ---- 全量快照的超时策略：**不许沿用 api() 的默认值** ----
+    #
+    # 缺陷①：`api()` 默认 `timeout=35, tries=6` ⇒ 最坏阻塞约 258 秒，
+    # 而碰/吃窗口只有 **1 秒** ⇒ 必然错过，且把整个 GameRunner 卡住。
+    # 判据不看实现、只看"它实际上传了什么超时" ⇒ 拦截 `api` 记录 kwargs。
+    print()
+    print("[全量快照的超时策略]")
+    _orig_api = globals()["api"]
+    _seen = {}
+
+    def _fake_api(method, path, server=None, token=None, body=None, **kw):
+        _seen["method"] = method
+        _seen["path"] = path
+        _seen.update(kw)
+        return {"snapshot": {"seat": 2}, "seq": 7}
+
+    globals()["api"] = _fake_api
+    try:
+        _got = _fetch_full_snapshot("srv", "tok", "a_x_r1_b0_t0")
+        chk("全量快照 timeout=1.5（不是默认 35）", _seen.get("timeout"), 1.5)
+        chk("全量快照 tries=1（不重试）", _seen.get("tries"), 1)
+        chk("全量快照确实走 seq=0",
+            str(_seen.get("path", "")).endswith("state?seq=0"), True)
+        chk("返回体可直接取 snapshot（不用再包一层）",
+            (_got.get("snapshot") or {}).get("seat"), 2)
+    finally:
+        globals()["api"] = _orig_api
+
+    # ---- 分段计时的**段序**：错位会把读数指向错误的优化目标 ----
+    #
+    # 目标第 3 条要求"分别测快照获取、特征计算、推理和提交，找出真实瓶颈"。
+    # 原实现只到 GET 为止（四段）⇒ 决策与提交的耗时**根本没被测量**，
+    # 于是"模型慢"和"等待慢"在日志里长得一模一样。补成六段后必须钉死顺序。
+    print()
+    print("[分段计时段序]")
+    _txt0, _n0 = _seg_report([])
+    chk("无数据时返回空文本与 0", (_txt0, _n0), ("", 0))
+    _segs = [[10.0, 1.0, 2.0, 3.0, 4.0, 5.0],        # 总 22
+             [0.0, 100.0, 0.0, 0.0, 0.0, 0.0],       # 总 0（gap 极大但不在最慢批）
+             [20.0, 0.0, 0.0, 30.0, 40.0, 50.0]]     # 总 140 ← 最慢
+    _txt, _n = _seg_report(_segs, frac=0.34)
+    chk("最慢批至少 1 段", _n >= 1, True)
+    chk("五段名字都在同一行里",
+        all(k in _txt for k in ("gap", "令牌", "GET", "决策", "提交")), True)
+    chk("最慢批 = 第 3 条（GET30 决策40 提交50）",
+        _txt.endswith("GET30 决策40 提交50"), True)
+
+    # ---- 网络类异常必须认得出，且必须与"服务端明确拒绝"分开 ----
+    #
+    # 目标第 3 条："动作提交超时后，先重新获取状态确认是否已经执行，不能盲目重发。"
+    # 实测发现的真实形态**更严重**：`api()` 根本不为超时重试（只重试 429/5xx/
+    # 409+MATCH_BUSY），所以超时会一路穿透到最外层兜底 `except Exception`，
+    # 把整个 GameRunner 结束掉 —— 日志里长成"这一场只打了 1~3 手就结束"。
+    # 所以第一步是**认得出它**；认不出就什么处置都谈不上。
+    print()
+    print("[网络类异常的识别]")
+    import urllib.error as _ue
+    chk("超时 -> 网络类", _is_network_error(TimeoutError("read timed out")), True)
+    chk("URLError -> 网络类", _is_network_error(_ue.URLError("reset")), True)
+    chk("ConnectionResetError -> 网络类",
+        _is_network_error(ConnectionResetError("reset")), True)
+    chk("409（服务端明确拒绝）-> **不是**网络类",
+        _is_network_error(ApiError(409, '{"code":"INVALID_ACTION"}')), False)
+    chk("500 -> 不是网络类（走 ApiError 分支）",
+        _is_network_error(ApiError(500, "boom")), False)
+    chk("普通异常 -> 不是网络类", _is_network_error(ValueError("x")), False)
+    chk("恢复预算上限是正数且不至于永远循环", 0 < _MAX_NET_RECOVER <= 32, True)
 
     # ---- 陈旧快照判据 ----
     # 这条守的是**实测丢掉的胡牌**：14 个被 409 拒绝的 (房间,局) 里，

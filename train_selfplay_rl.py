@@ -1206,6 +1206,18 @@ def paired_eval(seeds, arm_a, arm_b, opp_specs, base_genome, cfg, sds, nproc,
                    "opp_win": np.int64(out["opp_win"]), "opp_n": np.int64(out["opp_n"]),
                    "canon": out["canon"]}
     if dump:
+        # ★★ 2026-10-09：**先建目录再落盘** ★★
+        #   缺陷：默认 dump 路径是 `_tmp/eval_<ts>.npz`（见 run_eval 的调用点），
+        #   而 `_tmp/` 是**运行期临时目录**、干净检出里并不存在
+        #   ⇒ `np.savez_compressed` 抛 FileNotFoundError。
+        #   代价特别大：它在**全部配对评估跑完之后**才崩
+        #   （实测 120 seed / 4 进程 / 488 秒算完），而报告是在落盘**之后**才打印
+        #   ⇒ 结果全部丢掉、只剩一条 traceback。
+        #   本仓其它工具（build_teacher_data / export_* / merge_live …）都写了
+        #   `os.makedirs(..., exist_ok=True)`，只有这一处漏了。
+        _d = os.path.dirname(os.path.abspath(dump))
+        if _d:
+            os.makedirs(_d, exist_ok=True)
         np.savez_compressed(dump, **{k: v for k, v in out["_raw"].items()})
         if log is not None:
             log("      （逐手原始数组已落盘 -> %s）" % dump)
@@ -2311,6 +2323,61 @@ def train(args):
 
 
 # ================================================================ BC 训练（热启动）
+def _bc_dump(path, res_tr, res_va, log=None):
+    """把采集到的 BC 数据落盘（`--bc-dump`）。
+
+    ★ 为什么需要它：**采集是贵的，训练是便宜的。**
+      实测（2026-10-09）：600 房采集 ≈ 41 分钟（`--nproc 3`），
+      而 4 个 epoch 的 BC 训练只要几分钟。
+      而第 10 轮的实测结论要求**扫 `--bc-kl-beta`**
+      （β=0.1 时候选相对原模型的分叉率已达 **0.9792** ⇒ 没有起到"减少遗忘"的作用）。
+      ⇒ 不解耦的话，扫 3 个 β 就要重复 3 次 41 分钟的采集，而且三次的
+        **局面分布还未必一样**（seed 段固定，但采集有并行调度）——
+        那样扫出来的差异里混着"数据不同"的成分 ✗。
+      ⇒ 落盘后，同一次采集可以喂给任意组超参，**对照组之间数据完全一致** ✓
+
+    格式：每个子进程一份、每个头（turn/win）四个数组（s / c / n / a），
+    与 `--bc-from-npz` 的 `_task()` 结构同构 ⇒ 加载后直接可用。
+    """
+    import numpy as _np
+    d = {"n_tr": _np.int64(len(res_tr)), "n_va": _np.int64(len(res_va))}
+    for tag, rs in (("tr", res_tr), ("va", res_va)):
+        for i, r in enumerate(rs):
+            d["%s%d_npts" % (tag, i)] = _np.int64(r.get("n_pts", 0))
+            for kind in ("turn", "win"):
+                for f in ("s", "c", "n", "a"):
+                    d["%s%d_%s_%s" % (tag, i, kind, f)] = _np.asarray(r[kind][f])
+    _dd = os.path.dirname(os.path.abspath(path))
+    if _dd:
+        os.makedirs(_dd, exist_ok=True)
+    _np.savez(path, **d)
+    if log is not None:
+        log("  ★ 采集数据已落盘 -> %s（%.1f MB）—— 之后扫超参用 `--bc-load` 免采集"
+            % (path, os.path.getsize(path) / 1e6 if os.path.exists(path) else 0.0))
+
+
+def _bc_load(path, log=None):
+    """读回 `_bc_dump` 落盘的数据 ⇒ `(res_tr, res_va)`。"""
+    import numpy as _np
+    z = _np.load(path, allow_pickle=False)
+    out = []
+    for tag in ("tr", "va"):
+        rs = []
+        for i in range(int(z["n_" + tag])):
+            r = {"n_pts": int(z["%s%d_npts" % (tag, i)]),
+                 "dropped": 0, "fallbacks": 0, "errors": 0,
+                 "n_games": 0, "secs": 0.0}
+            for kind in ("turn", "win"):
+                r[kind] = {f: z["%s%d_%s_%s" % (tag, i, kind, f)]
+                           for f in ("s", "c", "n", "a")}
+            rs.append(r)
+        out.append(rs)
+    if log is not None:
+        log("  ★ 复用已落盘的采集数据：%s（训练 %d 段 / 验证 %d 段）—— **跳过采集**"
+            % (os.path.basename(path), len(out[0]), len(out[1])))
+    return out[0], out[1]
+
+
 def run_bc(args):
     """行为克隆：用规则基因组自己的决策，监督"同状态内候选排序"（交叉熵）。
 
@@ -2468,11 +2535,15 @@ def run_bc(args):
             % (os.path.basename(args.bc_from_npz), n_all, len(tr_ids), len(va_ids)))
         log("     其中 turn 头 %d 条 / win 头 %d 条"
             % (int((K_all == 0).sum()), int((K_all == 1).sum())))
+    if res_tr is None and getattr(args, "bc_load", ""):
+        res_tr, res_va = _bc_load(args.bc_load, log=log)
     if res_tr is None:
         res_tr = run_children("bc", _jobs("tr", args.seed_base, n_tr), "bc_tr", log=log,
                               keep=args.keep_tasks)
         res_va = run_children("bc", _jobs("va", args.val_base, n_va), "bc_va", log=log,
                               keep=args.keep_tasks)
+        if getattr(args, "bc_dump", ""):
+            _bc_dump(args.bc_dump, res_tr, res_va, log=log)
     res = res_tr + res_va
     idx_tr = list(range(len(res_tr)))
     idx_va = list(range(len(res_tr), len(res)))
@@ -2926,6 +2997,12 @@ def build_parser():
     ap.add_argument("--bc-tail-alpha", type=float, default=0.0,
                     help="尾部加权系数：w = 1 + α·max(0, 番−1)；0 = 关闭（默认）")
     ap.add_argument("--bc-log", default="rl_bc.log")
+    ap.add_argument("--bc-dump", default="",
+                    help="★ 把采集到的 BC 数据落盘（npz）。**采集贵、训练便宜**："
+                         "落盘后可用 `--bc-load` 复用同一份数据扫超参（如 --bc-kl-beta），"
+                         "既不重复花 41 分钟采集，又能保证各对照组**数据完全一致**")
+    ap.add_argument("--bc-load", default="",
+                    help="直接复用 `--bc-dump` 落盘的数据，**跳过采集**")
     ap.add_argument("--teacher", default=BASE_GENOME,
                     help="BC 的老师（默认线上基因组）")
     ap.add_argument("--eval-ckpt", default="")
@@ -2967,6 +3044,21 @@ def main():
     if args.run_task:
         return run_task_main(args.run_task)
     args.arm_a_given = ("--arm-a" in sys.argv)
+    args.arm_b_given = ("--arm-b" in sys.argv)
+    # ★★ 2026-10-09：**防一个代价很大的静默分派** ★★
+    #   实测（我自己踩的）：只写 `--arm-a ... --arm-b ...` 而漏了 `--eval-ckpt`，
+    #   下面的分派会**掉进 `train(args)`** —— 也就是**静默启动一次完整的 PPO 训练**：
+    #   拉起 4 个子进程、写 `rl_ckpt_*.pt` / `rl_history.jsonl` / `rl_train.log`，
+    #   同时把正在跑的另一个训练拖慢，而**屏幕上看起来"评估正在跑"**。
+    #   ⇒ 与其"猜用户想要评估"，不如**直接报错**：口径歧义时宁可停下。
+    if not (args.eval_null_test or args.eval_ckpt) and (args.arm_a_given or args.arm_b_given):
+        ap.error("--arm-a / --arm-b 只对**配对评估**有意义，而评估还需要 "
+                 "--eval-ckpt（或 --eval-null-test）。\n"
+                 "  · 现在这样会静默进入**训练**分支（本检查就是为防这个）。\n"
+                 "  · 要比较两个检查点：\n"
+                 "      --eval-ckpt <A.pt> --arm-a ckpt:<A.pt> --arm-b ckpt:<B.pt> "
+                 "--eval-n <N>\n"
+                 "  · 要跑空对照：--eval-null-test --eval-n <N>")
     if args.smoke:
         # 8 房 × 8 手 = 64 手；验证 6 房 × 8 手 = 48 手（两臂共 96 手）
         args.iters, args.games, args.nproc = 2, 8, 4

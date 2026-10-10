@@ -13,14 +13,13 @@
       本模块额外做一次**硬核对**：`MJ_USE_GPU=1` 时若 `torch.__version__` 里含 "cpu"
       就直接抛错，而不是打印一行容易被忽略的警告。
 
-  (b) numpy 的坑（本机专属，实测）：仓库自带的 `_pkgs/` **只有 torch 及其依赖，
-      没有 numpy**；而 venv (`_venv/`, py3.14.7) 是 `include-system-site-packages=false`，
-      numpy 2.5.3 只装在**基础解释器** `C:\\Program Files\\Python314\\Lib\\site-packages`。
-      基础解释器的 `python.exe` 在本沙箱里**不能直接执行**（Access is denied），
-      只有 `_venv\\Scripts\\python.exe` 能跑 ⇒ 必须把基础解释器的 site-packages
-      **挂进 sys.path**，否则 `import numpy` 直接 ModuleNotFoundError
-      （而 torch 会先给一句 "Failed to initialize NumPy" 的警告继续跑）。
-      这里按 `_venv/pyvenv.cfg` 里的 `home = ` 反查，不写死盘符。
+  (b) numpy 的坑：仓库自带的 `_pkgs/` **只有 torch 及其依赖，没有 numpy**。
+      如果运行的解释器里 `import numpy` 失败（例如 venv 是
+      `include-system-site-packages=false`、而 numpy 只装在基础解释器里），
+      就必须把那个 site-packages **挂进 sys.path**，否则 `import numpy` 直接
+      ModuleNotFoundError（而 torch 只会给一句 "Failed to initialize NumPy" 的警告继续跑）。
+      `find_numpy_site()` 按 `_venv/pyvenv.cfg` 的 `home =` 反查、并用 `sysconfig`
+      与**环境变量**枚举候选 —— **不写死任何盘符或绝对路径**（见该函数注释）。
 
 用法（**必须在 `import torch` / `import numpy` 之前**）：
     import rl_boot
@@ -50,7 +49,16 @@ def _add(p, front=True):
 
 
 def find_numpy_site():
-    """找出含 numpy 的 site-packages（**不猜**：逐个候选实际探测 `numpy/` 是否存在）。"""
+    """找出含 numpy 的 site-packages（**不猜**：逐个候选实际探测 `numpy/` 是否存在）。
+
+    ★ 可移植性要求：这里**不许出现写死的盘符/绝对路径**（否则别人 clone 下来就废）。
+      所以候选全部由「相对当前解释器的位置」+「标准环境变量」拼出来：
+        · `MJ_NUMPY_SITE`（显式指定，最高优先）
+        · venv 的 `pyvenv.cfg` 里的 `home =`（反查基础解释器）
+        · `sysconfig` 给出的 purelib / platlib（**跨平台**的唯一正确写法）
+        · `sys.base_prefix` / `sys.prefix`
+        · Windows 上其它 Python 安装（用 `ProgramFiles` 等**环境变量**拼，不写盘符）
+    """
     cands = []
     env = os.environ.get("MJ_NUMPY_SITE")
     if env:
@@ -66,12 +74,31 @@ def find_numpy_site():
                         cands.append(os.path.join(home, "Lib", "site-packages"))
         except OSError:
             pass
-    # ② 常见安装位置
-    cands += glob.glob(r"C:\Program Files\Python*\Lib\site-packages")
-    cands += glob.glob(r"C:\Program Files (x86)\Python*\Lib\site-packages")
+    # ② 当前解释器自己报的站点目录（跨平台正确写法）
+    try:
+        import sysconfig
+        for key in ("purelib", "platlib"):
+            p = sysconfig.get_paths().get(key)
+            if p:
+                cands.append(p)
+    except Exception:                                                # noqa: BLE001
+        pass
+    # ③ 基础/当前前缀（Windows 布局）
     cands.append(os.path.join(sys.base_prefix, "Lib", "site-packages"))
     cands.append(os.path.join(sys.prefix, "Lib", "site-packages"))
+    # ④ 机器上**其它** Python 的安装位置：用环境变量拼，绝不写死盘符
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(var)
+        if not root:
+            continue
+        cands += glob.glob(os.path.join(root, "Python*", "Lib", "site-packages"))
+        cands += glob.glob(os.path.join(root, "Programs", "Python",
+                                        "Python*", "Lib", "site-packages"))
+    seen = set()
     for p in cands:
+        if not p or p in seen:
+            continue
+        seen.add(p)
         try:
             if os.path.isdir(os.path.join(p, "numpy")):
                 return p

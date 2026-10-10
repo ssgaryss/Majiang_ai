@@ -1,7 +1,9 @@
 # 麻将 Bot —— 使用说明书
 
-> **规范位置**：本包位于 `E:\MyGithub\mahjong_ai_submit`
-> （开发仓在 `E:\MyGithub\majiang_bot`，本包是从它**自动抽取**出来的）。
+> **本包位置**：就是你 clone / 解压出来的那个目录（下文统一写作 `<本包目录>`）。
+> **本包是自足的**：只依赖「本目录 + 一个 Python 3.10+ 解释器」，**不依赖任何其它目录**。
+> （历史上它是从另一个开发仓自动抽取出来的；那个仓与本包已**分叉**且将被删除
+> ⇒ 任何指向它的说明都已作废，见 §2。为可移植起见，本文件**不写任何绝对路径**。）
 >
 > 面向「杭州麻将」对战平台的可参赛 Bot。✅ **已实测能入席并打完一整场**（真实日志见 §12.1）。
 >
@@ -28,7 +30,29 @@
 
 ## 1. 这是什么
 
-一个**完整闭环**的麻将 AI：
+一个能**真实上桌对战的「杭州麻将」AI Bot**，纯 Python 实现，CPU 就能跑。
+
+**玩法要点**（杭麻特有，代码里都实现了）：白板 = **财神**（百搭）；**只能自摸，不能点炮**；
+禁止抢杠胡；抓打圈；牌墙剩最后 10 墩不算杠；吃最多 2 摊；番型含爆头 / 财飘 / 七对倍率。
+
+**两套策略臂**（同一个客户端里可切换，见 §6）：
+
+| 臂 | 形态 |
+|---|---|
+| 规则臂 `shanten:…` | 8 位**基因组**：`discard : peng : chi : gang : decline : ukeire : route : feed`，手写启发式 |
+| 神经臂 `ckpt:…` | **候选打分网络**（CandNet）：同状态下给候选动作排序；990,723 参数、hidden=512、state_dim=370 |
+
+**当前部署权重**：`rl_aux_0004.pt`（`iter=4`，SHA256 `9FC3A97C…`）。`live_ab_arms.txt` 决定线上用哪些臂。
+
+**工程上做了什么**（都是实测踩出来的）：
+
+- 平台协议层：**HTTP 长轮询** + **令牌桶自适应限速**（撞 429 自动降速、长期不撞自动恢复）+ **409 重建**
+- 对局引擎：**状态去重签名**（含响应窗口身份：响应的哪张弃牌 / 哪些座位 / 抓打圈开关）
+  ⇒ 同一状态绝不重复提交；`窗口错过` 与 `409` 分开计数
+- 网络健壮性：快照 GET / 动作 POST 的**超时与抖动不再打死整场**（按网络类异常单独归类）
+- 分段计时：GET / 决策 / 提交分开测，找真实瓶颈而不是猜
+- **可移植**：代码里**没有任何绝对路径**；依赖只有 `numpy` + `torch`，用 `pip install` 即可
+- **可自检**：`start_live.bat -Check` 一口气验解释器 / numpy / torch / 导入链
 
 ```
 run_live.py  ── 实战启动器（等开赛 / 自动匹配 / 循环攒样本）
@@ -43,7 +67,12 @@ run_live.py  ── 实战启动器（等开赛 / 自动匹配 / 循环攒样本
    └─ feature*     特征（供神经臂使用）
 ```
 
-对局平台：`https://10.240.169.190:18080`（自签证书，客户端跳过校验）。
+对局平台：默认 `https://10.240.169.190:18080`（自签证书，客户端跳过校验）。
+**它不是写死的**：`--server <URL>` 或环境变量 `MJ_SERVER` 都能覆盖（见 §2）。
+
+> **本仓库只放这一个 README。** 工作台账、线上 A/B 协议、恢复清单、项目介绍正文
+> 都在开发机的 `temp/docs/`（被 `.gitignore` 忽略、不进仓库）。
+
 
 ---
 
@@ -58,36 +87,59 @@ pip install -r requirements.txt      # numpy>=2.0, torch>=2.4
 其余全是 Python 标准库（`urllib` / `ssl` / `threading` / `json` / `argparse` …）。
 **打牌只需要 CPU 版 torch**；GPU 只有训练才用。
 
-### 本机（开发机）已配好，零配置可跑
+### 依赖：两种情况，都**不需要任何外部目录**
 
-本机 venv 原本 `import numpy` / `import torch` **都失败**：仓库自带的 `_pkgs/`
-是**解包目录**（没有 `.whl` ⇒ 不能 `pip install`），而 `numpy` 只装在基础解释器里。
-已在 venv 里放了一个路径文件：
+`rl_boot.bootstrap()` 会 `_add(<rl_boot.py 自己所在目录>/_pkgs)`。
+`_pkgs/` **在 Git 里被忽略**（526 MB，不适合进仓库）⇒ 分两种情况：
+
+**情况 ①：从 GitHub 全新 clone（别人部署就是这个）**
+
+```powershell
+pip install -r requirements.txt          # numpy>=2.0, torch>=2.4 —— 只需这一条
+```
+
+`_pkgs/` 不存在时 `rl_boot` 会用**已安装的** torch（同样的 API，权重是纯 `state_dict`，不挑来源）。
+**验证方式**（最重要的一步，别跳）：
+
+```powershell
+python -c "import rl_boot; rl_boot.bootstrap()"
+# 应打印： torch 2.14.0+cpu（build=None, cuda=False）
+python -c "import mj_arena; print(type(mj_arena.make_strategy('ckpt:rl_aux_0004.pt')).__name__)"
+# 应打印： NetPolicy      ← 生产权重能加载
+```
+
+**情况 ②：本机（已经有 `_pkgs/`）**
 
 ```
-_venv\Lib\site-packages\_repo_deps.pth
-    E:\MyGithub\majiang_bot\_pkgs
-    C:\Program Files\Python314\Lib\site-packages
+_pkgs/    ← 本目录内：torch 2.14.0+cpu + sympy/networkx/jinja2/filelock/fsspec/mpmath/markupsafe
 ```
 
-效果：用 `_venv\Scripts\python.exe` 从**任意目录**（含本目录）都能直接
-`import numpy 2.5.3` / `import torch 2.14.0+cpu`，**不需要设 `PYTHONPATH`**。
-删掉该 `.pth` 即回退。
+`numpy` 用解释器自带的（本机是 2.5.3）；`torch` 从本目录 `_pkgs/` 自动挂上，**不需要设 `PYTHONPATH`**。
 
-> `rl_boot.bootstrap()` 会先找**自己所在目录**的 `_pkgs/`。本目录里没有 ⇒ 它
-> **静默跳过**、直接用已安装的 torch。这是设计内的回退，**不要改代码**。
+> ⚠ **历史说明（已作废）**：早先本目录**没有** `_pkgs/`，那时的做法是在另一个目录的 venv 里加
+> `.pth` 借依赖（`_repo_deps.pth` 指向 `<旧目录>\_pkgs`）。**那个做法已经不需要了，也不要用。**
+> 现在本包只依赖：**本目录 + 一个 Python 3.10+ 解释器**。
+>
+> ★ **可移植性约定（改代码时必须守住）**：代码里**不许出现写死的盘符/绝对路径**。
+> 已有工具可随时自查：`python tools/check_selfcontained.py`（传递依赖闭包，rc=0 才算自足）。
 
 ### 解释器（下文所有命令统一用 `$PY`）
 
-本机的 venv 在**开发仓里**，不在本目录里 —— 所以下面所有示例都用**绝对路径变量**，
-**从任何工作目录都能跑**（不要用 `..\_venv\...` 这种相对写法：换个位置就失效）：
+本包**不自带解释器**。用**任何一个 Python 3.10+** 都行：
 
 ```powershell
-$PY = 'E:\MyGithub\majiang_bot\_venv\Scripts\python.exe'
-& $PY -c "import numpy, torch; print(numpy.__version__, torch.__version__)"   # 自检
+$PY = 'python'          # 只要在 PATH 上；或写全路径
+& $PY -c "import numpy; import rl_boot; rl_boot.bootstrap()"   # 自检
 ```
 
-预期打印 `2.5.3 2.14.0+cpu`。
+预期打印 `[rl_boot] repo=<本目录>`、`torch 2.14.0+cpu`。
+**注意 `repo=` 必须指向本目录** —— 那说明 `_pkgs/` 是按「rl_boot.py 自己所在目录」找到的。
+
+> 找不到解释器时，`start_live.ps1` 会按 `MJ_PYTHON` → 本目录 `_venv/.venv` → 系统安装位置
+> → `py -3` 的顺序**自己去找**；也可以显式指定：`$env:MJ_PYTHON = '<python.exe 路径>'`。
+> 平台地址同理：`MJ_SERVER` 环境变量可覆盖（默认在 `my_bot.py` 里）。
+
+
 
 ---
 
@@ -96,7 +148,7 @@ $PY = 'E:\MyGithub\majiang_bot\_venv\Scripts\python.exe'
 ### 先做自检（10 秒，不联网）
 
 ```powershell
-cd E:\MyGithub\mahjong_ai_submit
+cd <本包目录>            # 你 clone / 解压出来的那个目录
 & $PY tools\smoke_core.py .
 ```
 
@@ -397,14 +449,23 @@ POST /api/match                    入席开房 {"M": m, "Rounds": r}
 **运行环境重启会杀掉全部后台作业**（本会话实测连续三次）。现象可能是
 `Job runner exited with exit code …` 或 `pwsh` 工具直接报错。
 
-恢复清单见本目录 [`RECOVER_NOW.md`](RECOVER_NOW.md)（含只读判断法 + 两条自启命令）。
-核心是**先查谁死了**（只读 mtime），**不要假设**：
+**恢复的核心是「先查谁死了」，不要假设**（只读 mtime 即可）：
 
 ```powershell
-foreach ($lg in @('..\live.log','..\rl_self2.log')) {
-  if (Test-Path $lg) { $f=Get-Item $lg; $lg + ' mtime 距今 ' + [math]::Round(((Get-Date)-$f.LastWriteTime).TotalSeconds) + ' s' }
-  else { $lg + ' 不存在' }
+cd <本包目录>
+'现在 = ' + (Get-Date -Format 'HH:mm:ss')
+foreach ($lg in @('live.log','keep_live.log')) {
+  if (Test-Path $lg) { $lg + '  ' + [math]::Round(((Get-Date)-(Get-Item $lg).LastWriteTime).TotalSeconds) + ' s 前' }
+  else { $lg + '  不存在' }
 }
+```
+
+判读：`live.log` **< 60 s** ⇒ 还在打；**> 5 分钟** ⇒ 断了，重新起：
+
+```powershell
+.\start_live.bat -Check     # 先自检（不联网）
+.\start_live.bat            # 起一窗
+powershell -NoProfile -ExecutionPolicy Bypass -File .\keep_live.ps1   # 要常驻就加这条
 ```
 
 - **只许一条客户端**：两个客户端用**同一个令牌**会共抢令牌桶 ⇒ 实测 **409 占 9%**、
@@ -502,9 +563,9 @@ foreach ($lg in @('..\live.log','..\rl_self2.log')) {
 ### 12.1 ★★ 真实参与线上匹配（最强证据）
 
 客户端曾成功入席并**打完一整场**（2026-10-08 21:00:53 起）。★ **说明**：那次是从
-一份**与本目录逐字节相同**的副本（`E:\MyGithub\majiang_bot\mahjong_ai_submit`）跑的
-（代码与权重经 SHA256 校验一致，见 §12.2）；本目录自身的可用性由 §12.4 的冒烟
-在本目录内直接验证过。
+一份与本目录逐字节相同的副本跑的（代码与权重经 SHA256 校验一致，见 §12.2）；
+本目录自身的可用性由 §12.4 的冒烟在本目录内直接验证过，
+并且已由 `start_live.bat -Check` 与 `mj_bot.py` 全量自测在**本目录内**复核通过。
 
 ```
 POST /api/match {"M":10,"Rounds":16} -> 房号 a_8d365f43de51
@@ -555,14 +616,18 @@ POST /api/match {"M":10,"Rounds":16} -> 房号 a_8d365f43de51
 覆盖：136 张牌守恒、碰/吃窗口与超时、财飘/链断/爆头、暗杠/明杠/补杠、七对倍率、
 番数与结算。末行 `=== 模拟器自测全部通过 ===`。
 
-### 12.6 交付物与源码是否一致（防止"改过源码但没重抽"）
+### 12.6 本包是否自足（**不对照任何外部目录**）
 
 ```powershell
-Get-ChildItem . -File -Filter *.py | ForEach-Object {
-  $src = Join-Path 'E:\MyGithub\majiang_bot' $_.Name
-  if ((Get-FileHash $_.FullName).Hash -ne (Get-FileHash $src).Hash) { 'DIFF ' + $_.Name }
-}
+& $PY tools\check_repo_hygiene.py      # 白名单 / 敏感文件 / 核心文件是否齐全
+& $PY tools\smoke_core.py .            # 依赖 + 导入链能不能跑
+& $PY -c "import rl_boot; rl_boot.bootstrap()"   # repo= 必须指向本目录
 ```
+
+> ⚠ 这里原本是一段「与开发仓逐个比哈希」的脚本
+> （`Join-Path '<旧目录>' $_.Name` …）。**已删除**，两个原因：
+> 1. 本包**现在是权威源码**（改的就是它），没有"另一个仓"可比 —— 那是抽取期的临时校验；
+> 2. 那种比法会让本包**永久依赖一个即将被删掉的目录**，与"只依赖本目录"的要求直接冲突。
 
 ### 12.7 静态核对：抽取器 vs 仓内权威清单
 
@@ -570,12 +635,15 @@ Get-ChildItem . -File -Filter *.py | ForEach-Object {
 & $PY tools\core_manifest.py     # 仓内既有的核心闭包工具
 ```
 
-### 12.8 复现抽取
+### 12.8 复现抽取（**仅历史参考**）
 
-在**开发仓根目录**执行：
+> ⚠ 这一步属于**抽取期**的临时操作，现在**不需要也不建议**再跑：
+> 本包**已经是权威源码**（你改的就是它），没有"另一个仓"可抽取。
+> 保留这段只是为了说明本包当初是怎么来的。若真要复现，`--repo` 指向源仓、
+> `--out` 指向目标目录 —— **两个都请用相对路径或你自己的路径**。
 
 ```powershell
-python tools\extract_core.py --repo . --out E:\MyGithub\mahjong_ai_submit `
+python tools\extract_core.py --repo <源仓目录> --out <本包目录> `
   --roots run_live.py run_room.py train_selfplay_rl.py train_value.py `
           train_cand_ranker.py analyze_live_paired.py mj_bot.py my_bot.py `
           mj_arena.py mj_core.py mj_policy.py shanten_ref.py `
@@ -583,7 +651,7 @@ python tools\extract_core.py --repo . --out E:\MyGithub\mahjong_ai_submit `
   --assets rl_aux_0004.pt live_ab_arms.txt requirements.txt `
            global_token.txt tournament_token.txt `
   --dirs tools `
-  --map README_BOT.md=README.md --map RECOVER_NOW.md=RECOVER_NOW.md
+  --map README_BOT.md=README.md
 ```
 
 抽取是**确定性**的：入口清单 + `ast` 导入解析 ⇒ 同样的入口必然得到同样的文件集。
@@ -596,7 +664,7 @@ python tools\extract_core.py --repo . --out E:\MyGithub\mahjong_ai_submit `
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'torch'` | venv 里没装 torch，且本目录没有 `_pkgs/` | 见 §2：`pip install -r requirements.txt`，或恢复 `_venv\Lib\site-packages\_repo_deps.pth` |
+| `ModuleNotFoundError: No module named 'torch'` | 本目录没有 `_pkgs/`，解释器里也没装 torch | 见 §2：`pip install -r requirements.txt`（或把 torch 解到本目录 `_pkgs\`） |
 | 跑起来但**模型没上场**、行为像规则 | `live_ab_arms.txt` 带了 **BOM** ⇒ `startswith("ckpt:")` 判假 | 用无 BOM 的 UTF-8 重写该文件 |
 | 改了基因组但**行为没变** | 写了 7 位 ⇒ `route`/`feed` 静默保持 0 | 写满 8 位；多写会被显式拒绝 |
 | 一直连不上 / 立刻退出 | `--token-file` 默认是 `tournament_token.txt`，你忘了传 | 显式 `--token-file <你的文件>` |
@@ -604,7 +672,7 @@ python tools\extract_core.py --repo . --out E:\MyGithub\mahjong_ai_submit `
 | 大量 `409`、`窗口错过` 不为 0 | **两个客户端共用同一个令牌** ⇒ 抢令牌桶 | 只跑一个；要并行用不同账号令牌 |
 | 线上 p99 飙到 2000+ ms | 训练并发 > 3 | `--nproc 3` |
 | 训练突然慢 3–4 倍 | 等待期跑了分析脚本 / 有僵尸客户端抢 CPU | 等待期不加负载（硬规则⑥）；清掉多余客户端 |
-| 后台作业全没了 | **运行环境重启**会杀掉全部后台作业 | 按 `RECOVER_NOW.md` 恢复；**先查谁死了，别假设** |
+| 后台作业全没了 | **运行环境重启**会杀掉全部后台作业 | 按 §9「环境重启后的恢复」重起；**先查谁死了，别假设** |
 | `Job runner exited with exit code …` | 同上（环境重启） | 同上 |
 | 赛制不一致告警 | 自动房固定 `Rounds=8`，你请求了 16 | 正常现象，非缺陷 |
 | 多文件统计工具读数虚高 | 工具**硬编码**了文件列表，漏了新日志 | 一律用 glob 扫 `live_r16*.jsonl`（`tools/merge_live.py` 已修） |
@@ -630,7 +698,7 @@ python tools\extract_core.py --repo . --out E:\MyGithub\mahjong_ai_submit `
 代码 32 个 .py            ≈ 912 KB
 权重 rl_aux_0004.pt        3.81 MB（14 个张量 / 990,723 个参数）
 tools/  36 个 .py + 1 个 .jsonl
-文档    README.md / RECOVER_NOW.md
+文档    README.md（仓库内只有这一个）
 合计 ≈ 4.90 MB（预算 20 MB，余量 ≈15.1 MB）
 ```
 

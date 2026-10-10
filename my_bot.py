@@ -22,6 +22,7 @@
 """
 import argparse
 import json
+import os
 import ssl
 import sys
 import threading
@@ -29,7 +30,10 @@ import time
 import urllib.error
 import urllib.request
 
-SERVER = "https://10.240.169.190:18080"
+# 平台地址。★ 这是**唯一**一处平台配置，可用环境变量 `MJ_SERVER` 覆盖 ——
+#   别人 clone 之后要连自己的环境（不同 IP / 端口 / 域名）不用改代码。
+#   `run_live.py --server <URL>` 也会覆盖它。
+SERVER = os.environ.get("MJ_SERVER", "https://10.240.169.190:18080")
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows 控制台兜底
